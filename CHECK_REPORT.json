@@ -1,0 +1,27 @@
+{
+  "profile": "full",
+  "startedAt": "2026-11-27T13:34:53.636Z",
+  "checks": [],
+  "score": 0,
+  "max": 75,
+  "levels": {
+    "1": {
+      "got": 0,
+      "max": 24
+    },
+    "2": {
+      "got": 0,
+      "max": 14
+    },
+    "3": {
+      "got": 0,
+      "max": 22
+    },
+    "5": {
+      "got": 0,
+      "max": 15
+    }
+  },
+  "error": "instance 1 did not answer /healthz on port 4001 within 90 s. See .check-logs/instance-1.log",
+  "finishedAt": "2026-11-27T13:36:23.833Z"
+}
