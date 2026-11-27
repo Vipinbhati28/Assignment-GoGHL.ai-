@@ -1,0 +1,74 @@
+
+● The clean clone installs and starts, with /healthz returning 200 in about a
+  second, so I've stopped the test server. Two mismatches turned up against your
+  bullet list: the token bucket is 6 burst at 3.5/s rather than ~7, and levels
+  2 and 3 have never been run, so DECISIONS.md can't claim they pass. · summary
+
+● Write(README.md)
+  ⎿  Wrote 67 lines to README.md
+      1 # Switchboard
+      2
+      3 A shared team inbox. Customers write in through the Pigeon messag
+        ing provider;
+      4 support agents sign in, see conversations arrive live, claim them
+        , and reply.
+      5 Several workspaces share one deployment and never see each other'
+        s data.
+      6
+      7 ## Run it from a clean clone
+     … +60 lines (ctrl+o to expand)
+
+● Write(DECISIONS.md)
+  ⎿  Wrote 31 lines to DECISIONS.md
+      1 # Decisions
+      2
+      3 ## What we built
+      4 A multi-tenant shared inbox with these parts:
+      5 - **Login:** OIDC authorization code + PKCE (S256). The ID token
+        is checked against the IdP's JWKS, refetched when the `kid` is un
+        known because the IdP makes a new key on every restart.
+      6 - **Webhooks:** HMAC checked over the raw body, timestamps more t
+        han 5 minutes off rejected, deduplication by a unique `(workspace
+        , message_id)` index, threads ordered by `occurred_at` then messa
+     … +26 lines (~3 KB) (ctrl+o to expand)
+  ⎿  Read DECISIONS.md (31 lines)
+  ⎿  Read README.md (67 lines)
+  ⎿  Read scaffold\web\src\components\ThreadView.tsx (180 lines)
+  ⎿  Read scaffold\web\src\styles.css (115 lines)
+  ⎿  Read scaffold\web\src\App.tsx (79 lines)
+
+● I've written both files at the repo root: README.md and DECISIONS.md.
+
+  Written for: whoever grades or picks up the repo next.
+
+  Audit results
+  - What passed:
+    - Every rule in BRIEF.md and PIGEON.md is implemented.
+    - Levels 1 and 5 scored 24/24 and 15/15.
+    - Both builds are clean and the 12 unit tests pass.
+    - A fresh clone installs and starts from switchboard.json, and /healthz
+      returns 200.
+  - Levels 2 and 3 (crash recovery and multiple instances) have never been run.
+    The check stops servers with process.kill(-pid), which does nothing on
+    native Windows, so those levels need a run on Linux or WSL before their
+    points count.
+  - The frontend has only been tested by you, by hand. There are no automated UI
+    tests.
+
+  Differences from your instructions
+  - Token bucket numbers: DECISIONS.md gives the real values, a burst of 6 at
+    3.5 per second, not ~7.
+  - Extra limitations listed: besides the three you named, DECISIONS.md also
+    says:
+    - A socket waits 300 ms to fill a gap, so a late frame can be missed live
+      and only shows on reload.
+    - The cookie is only Secure when COOKIE_SECURE=true.
+    - There are no integration tests.
+  - Length: DECISIONS.md runs a bit over half a page because of those extra
+    lines.
+  - Setup command: the README shows cp .env.example .env, with your Windows copy
+    command next to it.
+
+  The fresh clone I used for the check is still at
+  C:\Users\HP\AppData\Local\Temp\claude\bd4746616c314872\df61c6a2-9855-487d-817d
+  -1d50982454a0\scratchpad\fresh; you can delete it whenever you like.
