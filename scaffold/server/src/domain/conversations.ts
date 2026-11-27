@@ -52,7 +52,7 @@ export async function setConversationState(workspace: string, contact: string, s
 }
 
 export interface InboxPage {
-  items: Array<Pick<ConversationDoc, 'contact' | 'assignee' | 'state'> & { last_activity_at: string }>;
+  items: Array<Pick<ConversationDoc, 'contact' | 'assignee' | 'state'> & { last_activity_at: string; last_text: string | null; last_direction: string | null }>;
   next_cursor: string | null;
 }
 
@@ -71,8 +71,24 @@ export async function listConversations(workspace: string, limit: number, cursor
   const docs = await conversations.find(filter).sort({ last_activity_at: -1, _id: -1 }).limit(limit + 1).toArray();
   const page = docs.slice(0, limit);
   const last = page[page.length - 1];
+  // Latest message per contact on this page, for the snippet. One query.
+  const latest = await (await col.messages())
+    .aggregate<{ _id: string; text: string; direction: string }>([
+      { $match: { workspace, contact: { $in: page.map((d) => d.contact) } } },
+      { $sort: { occurred_at: -1, pigeon_id: -1 } },
+      { $group: { _id: '$contact', text: { $first: '$text' }, direction: { $first: '$direction' } } },
+    ])
+    .toArray();
+  const snippet = new Map(latest.map((l) => [l._id, l]));
   return {
-    items: page.map((d) => ({ contact: d.contact, assignee: d.assignee, state: d.state, last_activity_at: d.last_activity_at.toISOString() })),
+    items: page.map((d) => ({
+      contact: d.contact,
+      assignee: d.assignee,
+      state: d.state,
+      last_activity_at: d.last_activity_at.toISOString(),
+      last_text: snippet.get(d.contact)?.text ?? null,
+      last_direction: snippet.get(d.contact)?.direction ?? null,
+    })),
     next_cursor: docs.length > limit && last ? Buffer.from(`${last.last_activity_at.getTime()}|${last._id!.toHexString()}`).toString('base64url') : null,
   };
 }

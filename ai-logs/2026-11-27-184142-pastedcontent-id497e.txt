@@ -1,0 +1,1473 @@
+
+> <context>
+  Read `BRIEF.md`, `PIGEON.md`, `REFERENCE.html`, `harness/check.js`,
+  `switchboard.json`, and the existing files in `scaffold/server` and
+  `scaffold/web`.
+  </context>
+
+  <stack>
+  - Backend: Existing `scaffold/server` (Node 22 + Express + TypeScript +
+  MongoDB + ioredis + ws) on `PORT` (default 4000)
+  - Frontend: Existing `scaffold/web` (Vite + React + TypeScript)
+  - Infrastructure: Already running via `docker-compose.yml` (MongoDB :27017,
+  Redis :6379, Pigeon :4010, Mock IdP :4020)
+  </stack>
+
+  <rules>
+  - Do NOT write any application code yet.
+  - Do NOT wrap our server in Docker; `npm run check` launches it directly via
+  `switchboard.json`.
+  - Cut Bonus Billing (Paybox), Elasticsearch, and E2E Encrypted Notes for now;
+  focus 100% on passing Levels 1, 5, 2, 3, and 4 (85 points).
+  - Design for multi-instance concurrency, `kill -9` crash recovery, and
+  unreliable upstream networks.
+  </rules>
+
+  <task>
+  1. Propose the exact MongoDB collections, unique indexes, and Redis keys (for
+  distributed per-workspace rate limiting, `Retry-After` cool-off, outbound
+  reply queue/leasing, WebSocket monotonic `seq`, and Redis Pub/Sub).
+  2. Map every required endpoint from `BRIEF.md` (`/healthz`, `POST
+  /webhooks/pigeon`, `/auth/login`, `/auth/callback`, `/api/me`,
+  `/api/conversations`, `GET /ws`, and the four `/__grader/*` endpoints) to
+  exact modules in `scaffold/server/src/`.
+  3. List the top edge cases from `PIGEON.md` and `harness/check.js` (HMAC raw
+  body + 5-min timestamp window, `occurred_at` ordering, `client_ref`
+  idempotency, 12s Pigeon slow-accept timeout, lease reclaim after `kill -9`)
+  and how our design handles each.
+  </task>
+
+● I'll read the spec files first.
+
+  Read 1 file, ran 2 shell commands (ctrl+o to expand)
+
+● Now a skim of REFERENCE.html for anything that changes the design.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● I've read all six inputs. No code is written yet. Below is the design, with a
+  few places where I chose differently from the prompt and say why.
+
+  1. Data model
+
+  Principle: MongoDB is the source of truth for anything that must survive kill
+  -9. That includes inbound messages, the outbound queue and its leases, and the
+  WebSocket frame log. Redis only holds things that can be lost or rebuilt:
+  rate-limit state, seq counters, sessions, OIDC login state and pub/sub.
+
+  Change from the prompt: the reply queue and its leasing live in MongoDB, not
+  Redis. A Redis list plus a lease means two stores to keep consistent, and
+  Redis isn't durable here. One Mongo findOneAndUpdate claims the job and takes
+  the lease in a single atomic step.
+
+  MongoDB collections
+
+  Collection: messages
+  Key fields: workspace, contact, direction ('in'/'out'), pigeon_id,
+    client_ref, text, occurred_at, status, status_rank, created_at + outbox
+    fields for outbound: send_state ('pending'/'inflight'/'done'/'dead'),
+    attempts, next_attempt_at, lease_owner, lease_until
+  Indexes: unique {workspace, pigeon_id} partial direction:'in' · unique
+    {workspace, client_ref} partial direction:'out' · {workspace, contact,
+    occurred_at, pigeon_id} (thread order and snapshot) · {send_state,
+    next_attempt_at} and {send_state, lease_until} (dispatcher)
+  ────────────────────────────────────────
+  Collection: conversations
+  Key fields: workspace, contact, assignee, state ('open'/'closed'),
+    last_activity_at
+  Indexes: unique {workspace, contact} · {workspace, last_activity_at:-1, _id}
+    (inbox pagination)
+  ────────────────────────────────────────
+  Collection: ws_events
+  Key fields: workspace, seq, key, type, payload, created_at
+  Indexes: unique {workspace, seq} (replay) · unique {workspace, key} (one
+    frame per fact, e.g. in:<pmsg>, st:<ref>:<status>) · TTL on created_at (24
+    h)
+
+  Indexes are created at boot, before /healthz returns 200. /__grader/reset runs
+  deleteMany on each collection rather than drop, so another instance never
+  runs without its unique indexes.
+
+  Redis keys
+
+  Key: rl:{ws}
+  Type / TTL: hash {tokens, ts}
+  Purpose: Token bucket, run by a Lua script that uses Redis TIME so all
+    instances share one clock. Set slightly below Pigeon's limit (≈7 burst,
+    3.5/s) to allow for skew.
+  ────────────────────────────────────────
+  Key: cool:{ws}
+  Type / TTL: string, PX = Retry-After × 1000
+  Purpose: Set on any 429. The same Lua script refuses a token while this key
+    exists.
+  ────────────────────────────────────────
+  Key: brk:{ws}
+  Type / TTL: string, PX ≈ 1000–2000
+  Purpose: Circuit breaker on 503 or timeout. It keeps an outage to about one
+    probe per second per workspace (the check penalises more than 6 requests/s
+    during an outage).
+  ────────────────────────────────────────
+  Key: seq:{ws}
+  Type / TTL: INCR
+  Purpose: Monotonic frame seq. Gaps are fine; it only needs to go up.
+  ────────────────────────────────────────
+  Key: sess:{id}
+  Type / TTL: hash, TTL 8 h
+  Purpose: Session: sub, workspaces[]. Kept on reset.
+  ────────────────────────────────────────
+  Key: oidc:{state}
+  Type / TTL: string, TTL 10 min, GETDEL
+  Purpose: PKCE verifier and nonce. Needed because /auth/login and
+    /auth/callback can reach different instances through the load balancer.
+  ────────────────────────────────────────
+  Key: channel events:{ws}
+  Type / TTL: pub/sub
+  Purpose: Fan-out of new frames to every instance's sockets. Uses a dedicated
+    subscriber connection.
+  ────────────────────────────────────────
+  Key: channel outbox:wake
+  Type / TTL: pub/sub
+  Purpose: Wakes dispatchers right after a reply is stored. They also poll
+    every ~500 ms.
+
+  2. Endpoint → module map (scaffold/server/src/)
+
+  Endpoint: GET /healthz
+  Module: index.ts
+  Logic lives in: 200 only after Mongo ping, Redis ping, index creation,
+    subscriber ready and dispatcher started
+  ────────────────────────────────────────
+  Endpoint: POST /webhooks/pigeon
+  Module: http/webhooks.ts (express.raw on this route only, mounted before
+    express.json)
+  Logic lives in: security/signature.ts (pure, unit-tested), domain/inbound.ts
+  ────────────────────────────────────────
+  Endpoint: GET /auth/login, GET /auth/callback
+  Module: http/auth.ts
+  Logic lives in: auth/oidc.ts (discovery, PKCE S256, token exchange, ID-token
+    check against /jwks, refetching on an unknown kid because the IdP rotates
+    its key on restart), auth/sessions.ts
+  ────────────────────────────────────────
+  Endpoint: GET /api/me, GET /api/conversations (+ messages, reply, claim,
+    close/reopen for the UI)
+  Module: http/api.ts
+  Logic lives in: http/middleware.ts (requireSession → 401, requireMember(ws)
+    → 403), domain/conversations.ts, domain/outbound.ts
+  ────────────────────────────────────────
+  Endpoint: GET /ws
+  Module: realtime/ws.ts (on the server's upgrade event: check the session
+    cookie and membership, otherwise write a 401 and destroy the socket)
+  Logic lives in: realtime/events.ts
+  ────────────────────────────────────────
+  Endpoint: POST /__grader/reset, GET /__grader/snapshot, POST
+    /__grader/reply, POST /__grader/claim
+  Module: http/grader.ts (graderToken middleware → 401)
+  Logic lives in: The same domain/* functions the UI routes call
+  ────────────────────────────────────────
+  Endpoint: (background)
+  Module: outbox/dispatcher.ts, outbox/pigeonClient.ts, outbox/rateLimit.ts
+    (Lua)
+  Logic lives in:
+
+  Shared helper: realtime/events.ts → emit(ws, key, frame). It runs INCR
+  seq:{ws}, inserts into ws_events (a duplicate key means skip, so no duplicate
+  frames), then publishes to events:{ws}.
+
+  New dependencies: ws, jose. Valid workspaces are the keys of
+  config.pigeon.apiKeys.
+
+  3. Edge cases and how the design handles them
+
+  #: 1
+  Edge case: HMAC over the raw body
+  Handling: Use the raw Buffer from express.raw, never re-serialised JSON.
+    Compute HMAC-SHA256 of `${t}.${body}`. Check the hex length first, then
+    timingSafeEqual. A missing or malformed header, or a mismatch, returns
+    401, never 5xx. The whole handler is wrapped so a DB error during
+    verification can't turn into a 5xx for a forged request.
+  ────────────────────────────────────────
+  #: 2
+  Edge case: 5-minute window
+  Handling: Reject when abs(now − t) > 300. The manual says "more than five
+    minutes from now", so far-future timestamps are rejected too. Replayed
+    events (stale_* ids) get 401.
+  ────────────────────────────────────────
+  #: 3
+  Edge case: Parse order (level 4)
+  Handling: Signature first, then JSON.parse. A body that won't parse returns
+    400. Unknown workspace, unknown type, or a status for an unknown
+    client_ref all return 2xx and are ignored.
+  ────────────────────────────────────────
+  #: 4
+  Edge case: At-least-once and duplicates
+  Handling: Inbound uses updateOne(upsert, $setOnInsert) on the unique
+    {workspace, pigeon_id}. A duplicate is a no-op and still gets 2xx. The
+    frame is keyed in:<pmsg>, so a crash between the two writes plus a retry
+    still yields exactly one frame.
+  ────────────────────────────────────────
+  #: 5
+  Edge case: occurred_at ordering
+  Handling: Never rely on arrival order. The thread, the snapshot inbound list
+    and the UI all sort by (occurred_at, pigeon_id). last_activity_at uses
+    $max.
+  ────────────────────────────────────────
+  #: 6
+  Edge case: Status out of order (delivered before sent)
+  Handling: Ranks: queued 0, sent 1, delivered/failed 2. The update filter is
+    status_rank < newRank, so status never goes backwards, and the first final
+    status wins.
+  ────────────────────────────────────────
+  #: 7
+  Edge case: Ack within 5 s, p95 < 1 s
+  Handling: Two indexed writes plus one INCR, then 200 after the write is
+    acknowledged (j:true). Never return 2xx before the write lands. That rule
+    is what makes kill -9 during the flood safe, because Pigeon retries for
+    about 22 s.
+  ────────────────────────────────────────
+  #: 8
+  Edge case: client_ref idempotency (even two identical requests at the same
+    instant)
+  Handling: Insert the outbound doc. The unique {workspace, client_ref} turns
+    the loser's insert into E11000, and both requests get 202. The
+    conversation is upserted so a reply to a contact who hasn't written yet
+    still works. 202 is sent only after the durable insert.
+  ────────────────────────────────────────
+  #: 9
+  Edge case: Exactly-once to Pigeon
+  Handling: Every send carries Idempotency-Key: <workspace>:<client_ref>. A
+    retry after a timeout, crash or failover reuses the key, so Pigeon returns
+    the original result and doesn't send again.
+  ────────────────────────────────────────
+  #: 10
+  Edge case: 12 s slow accept
+  Handling: Client timeout ≈ 4 s. The outcome is then unknown, so the job
+    keeps inflight and is retried later with the same key. The retry is
+    delayed past ~13 s so it doesn't overlap the still-pending original. I'll
+    confirm in pigeon/ source how a repeated key behaves while the first call
+    is still in flight. The status webhook may arrive before or instead of the
+    HTTP response; that's fine because status updates don't depend on send
+    state.
+  ────────────────────────────────────────
+  #: 11
+  Edge case: Retry-After / per-workspace limit across instances
+  Handling: Every send first takes a token from the shared Lua bucket. On 429
+    it sets cool:{ws}. A job that gets no token is released with
+    next_attempt_at = now + wait without spending an attempt. Because the
+    state is in Redis, two instances can't each spend their own 8-token
+    bucket.
+  ────────────────────────────────────────
+  #: 12
+  Edge case: Outage (all 503s)
+  Handling: The brk:{ws} breaker plus per-job exponential backoff, capped at
+    about 2 s so recovery is noticed quickly. Jobs remain pending, never dead,
+    for 503 or timeout.
+  ────────────────────────────────────────
+  #: 13
+  Edge case: Lease reclaim after kill -9
+  Handling: The dispatcher atomically claims {pending, next_attempt_at ≤ now}
+    OR {inflight, lease_until < now}, setting lease_owner = instanceId and
+    lease_until = now + 20s. The 20 s lease is longer than the 12 s slow
+    accept plus timeout. A restarted or surviving instance picks the job up
+    within about 20 s, inside the 60 s failover window, and the
+    Idempotency-Key makes the re-send safe.
+  ────────────────────────────────────────
+  #: 14
+  Edge case: Six-way claim race
+  Handling: First upsert $setOnInsert the conversation (retrying once on
+    E11000), then findOneAndUpdate({ws, contact, assignee ∈ {null, agent}},
+    {$set:{assignee: agent}}). A match returns 200 and emits
+    conversation.assigned; no match returns 409. It's one atomic document
+    operation, so it holds across instances.
+  ────────────────────────────────────────
+  #: 15
+  Edge case: WS seq rising across instances
+  Handling: Two instances can publish seq 42 before 41. Each socket tracks
+    lastSent, drops frames with seq ≤ lastSent, and on a gap waits about 300
+    ms, then backfills from ws_events.
+  ────────────────────────────────────────
+  #: 16
+  Edge case: WS replay (after=)
+  Handling: Subscribe first and buffer live frames, then query ws_events for
+    seq > after, send them, then flush the buffer deduplicated by seq. This
+    avoids the gap between the query and the subscription. The workspace
+    filter on every query keeps tenants apart.
+  ────────────────────────────────────────
+  #: 17
+  Edge case: Login across instances
+  Handling: PKCE state lives in Redis (oidc:{state}, GETDEL, single use). The
+    session cookie is opaque, HttpOnly and SameSite=Lax. After the callback
+    the user is redirected to WEB_ORIGIN. The harness stops following
+    redirects once it leaves :4000, so that's fine.
+
+  Things I'd confirm before coding
+
+  1. Idempotency-Key during the 12 s slow accept (row 10): does a repeat
+     arriving while the original is still pending return the original or a fresh
+     send? I'll check the pigeon/ source.
+  2. Session TTL (8 h) and the reset scope (keep sess:* and oidc:*, clear the
+     rest of Redis) are my own assumptions. Both go into DECISIONS.md.
+
+  If this looks right, the build order is: signature + inbound + snapshot/reset
+  → outbox, dispatcher and rate limit → claim (level 1) → OIDC, sessions, API
+  and WS (level 5) → then run levels 2 and 3, which this design should already
+  cover.
+
+> <task>
+  Approved. First inspect `pigeon/server.js` (specifically how
+  `Idempotency-Key` behaves during a slow-accept / in-flight request) and
+  `harness/check.js` (to verify exact `/__grader/*`, `/auth/*`, `/api/*`, and
+  `/ws` expectations).
+
+  Then implement the complete backend in scaffold/server/ following your exact
+  plan:
+  1. Core infrastructure: MongoDB connection + unique indexes created at boot
+  before /healthz returns 200, Redis client + dedicated Pub/Sub subscriber +
+  Lua token-bucket/cool-off script.
+  2. Security & Webhooks: Raw-body HMAC-SHA256 verification
+  (x-pigeon-signature, 5-minute timestamp window, 401 on invalid/stale, 400 on
+  invalid JSON after valid sig, 2xx on unknown workspace/type/unknown
+  client_ref), idempotent inbound deduplication, occurred_at + pigeon_id
+  ordering.
+  3. Outbox & Dispatcher: Durable MongoDB outbox with atomic leasing
+  (lease_until), Idempotency-Key header, per-workspace Redis rate limiting +
+  Retry-After cool-off + outage circuit breaker, and monotonic status rank
+  updates (queued -> sent -> delivered/failed).
+  4. Conversations & Claiming: Atomic findOneAndUpdate claim concurrency (200
+  winner / 409 conflict), close/reopen, paginated inbox list.
+  5. Auth & WebSockets: OIDC PKCE (S256) login/callback with dynamic JWKS key
+  refetching on unknown kid, Redis-backed session cookie, workspace membership
+  enforcement (401/403), and /ws?workspace=<id>&after=<seq> with monotonic
+  Redis INCR, ws_events backfill, and Redis Pub/Sub cross-instance fan-out.
+  6. Grader Endpoints: POST /__grader/reset, GET /__grader/snapshot, POST
+  /__grader/reply, POST /__grader/claim gated by x-grader-token.
+     </task>
+
+  <rules>
+  - Keep files modular as planned.
+  - Ensure `npm --prefix scaffold/server run build` (TypeScript compilation)
+  and `npm --prefix scaffold/server start` work cleanly with zero errors.
+  - Do NOT write the React frontend yet—we will verify Level 1 and Level 5 with
+  `npm run check` first.
+  </rules>
+
+  Read 1 file, ran 1 shell command (ctrl+o to expand)
+
+● Key Pigeon's replay check runs before the outage and cool-off checks, so a
+  retry after a timeout is safe; the bucket is 8 tokens refilling at 4/s, and
+  I'm moving on to the build setup next. · summary
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Pigeon confirms that retrying immediately with the same key after a timeout is
+  safe. Installing dependencies, then writing the modules.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Infrastructure first: config, db, redis.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Write(scaffold\server\src\db.ts)
+  ⎿  Added 80 lines, removed 3 lines
+       1 -import { MongoClient, type Db } from 'mongodb';                
+       1 +import { MongoClient, MongoServerError, type Collection, type D
+         +b, type ObjectId } from 'mongodb';                             
+       2  import { config } from './config.js';
+       3 
+       4 +export type Direction = 'in' | 'out';                          
+       5 +export type SendState = 'pending' | 'inflight' | 'done' | 'dead
+         +';                                                             
+       6 +                                                               
+       7 +export interface MessageDoc {                                  
+       8 +  _id?: ObjectId;                                              
+       9 +  workspace: string;                                           
+      10 +  contact: string;                                             
+      11 +  direction: Direction;                                        
+      12 +  pigeon_id: string | null;                                    
+      13 +  client_ref: string | null;                                   
+      14 +  text: string;                                                
+      15 +  occurred_at: Date;                                           
+      16 +  created_at: Date;                                            
+      17 +  author?: string | null;                                      
+      18 +  // outbound only                                             
+      19 +  status?: string;                                             
+      20 +  status_rank?: number;                                        
+      21 +  send_state?: SendState;                                      
+      22 +  attempts?: number;                                           
+      23 +  next_attempt_at?: Date;                                      
+      24 +  lease_owner?: string | null;                                 
+      25 +  lease_until?: Date | null;                                   
+      26 +  last_error?: string | null;                                  
+      27 +}                                                              
+      28 +                                                               
+      29 +export interface ConversationDoc {                             
+      30 +  _id?: ObjectId;                                              
+      31 +  workspace: string;                                           
+      32 +  contact: string;                                             
+      33 +  assignee: string | null;                                     
+      34 +  state: 'open' | 'closed';                                    
+      35 +  last_activity_at: Date;                                      
+      36 +  created_at: Date;                                            
+      37 +}                                                              
+      38 +                                                               
+      39 +export interface EventDoc {                                    
+      40 +  _id?: ObjectId;                                              
+      41 +  workspace: string;                                           
+      42 +  seq: number;                                                 
+      43 +  key: string;                                                 
+      44 +  frame: Record<string, unknown>;                              
+      45 +  created_at: Date;                                            
+      46 +}                                                              
+      47 +                                                               
+      48  let client: MongoClient | undefined;
+      49 
+       6 -// Connects on first use. Call from anywhere: const db = await 
+         -getDb();                                                       
+      50 +// Connects on first use. Writes are journaled so a 2xx/202 mea
+         +ns "survives kill -9".                                         
+      51  export async function getDb(): Promise<Db> {
+      52    if (!client) {
+       9 -    client = new MongoClient(config.mongoUrl);                 
+      53 +    client = new MongoClient(config.mongoUrl, { writeConcern: {
+         + w: 1, journal: true } });                                     
+      54      await client.connect();
+      55    }
+      56    return client.db();
+      57  }
+      58 +                                                               
+      59 +export const col = {                                           
+      60 +  messages: async (): Promise<Collection<MessageDoc>> => (await
+         + getDb()).collection<MessageDoc>('messages'),                  
+      61 +  conversations: async (): Promise<Collection<ConversationDoc>>
+         + => (await getDb()).collection<ConversationDoc>('conversations'
+         +),                                                             
+      62 +  events: async (): Promise<Collection<EventDoc>> => (await get
+         +Db()).collection<EventDoc>('ws_events'),                       
+      63 +};                                                             
+      64 +                                                               
+      65 +export const isDupKey = (e: unknown): e is MongoServerError => 
+         +e instanceof MongoServerError && e.code === 11000;             
+      66 +                                                               
+      67 +// Must finish before /healthz answers 200: every idempotency g
+         +uarantee rests on these.                                       
+      68 +export async function ensureIndexes(): Promise<void> {         
+      69 +  const db = await getDb();                                    
+      70 +  await db.command({ ping: 1 });                               
+      71 +  const messages = await col.messages();                       
+      72 +  await messages.createIndexes([                               
+      73 +    { key: { workspace: 1, pigeon_id: 1 }, name: 'uniq_inbound'
+         +, unique: true, partialFilterExpression: { direction: 'in' } },
+      74 +    { key: { workspace: 1, client_ref: 1 }, name: 'uniq_outboun
+         +d', unique: true, partialFilterExpression: { direction: 'out' }
+         + },                                                            
+      75 +    { key: { workspace: 1, contact: 1, occurred_at: 1, pigeon_i
+         +d: 1 }, name: 'thread' },                                      
+      76 +    { key: { send_state: 1, next_attempt_at: 1 }, name: 'outbox
+         +_pending' },                                                   
+      77 +    { key: { send_state: 1, lease_until: 1 }, name: 'outbox_lea
+         +se' },                                                         
+      78 +  ]);                                                          
+      79 +  const conversations = await col.conversations();             
+      80 +  await conversations.createIndexes([                          
+      81 +    { key: { workspace: 1, contact: 1 }, name: 'uniq_conversati
+         +on', unique: true },                                           
+      82 +    { key: { workspace: 1, last_activity_at: -1, _id: -1 }, nam
+         +e: 'inbox' },                                                  
+      83 +  ]);                                                          
+      84 +  const events = await col.events();                           
+      85 +  await events.createIndexes([                                 
+      86 +    { key: { workspace: 1, seq: 1 }, name: 'uniq_seq', unique: 
+         +true },                                                        
+      87 +    { key: { workspace: 1, key: 1 }, name: 'uniq_event_key', un
+         +ique: true },                                                  
+      88 +    { key: { created_at: 1 }, name: 'ttl', expireAfterSeconds: 
+         +24 * 3600 },                                                   
+      89 +  ]);                                                          
+      90 +}                                                              
+
+● Write(scaffold\server\src\redis.ts)
+  ⎿  Added 23 lines, removed 1 line
+       2  import { config } from './config.js';
+       3 
+       4  let redis: Redis | undefined;
+       5 +let subscriber: Redis | undefined;                             
+       6 
+       6 -// Connects on first use. Call from anywhere: const redis = get
+         -Redis();                                                       
+       7 +// Commands and PUBLISH. Connects on first use.                
+       8  export function getRedis(): Redis {
+       9    if (!redis) redis = new Redis(config.redisUrl, { lazyConnect:
+           false, maxRetriesPerRequest: 2 });
+      10    return redis;
+      11  }
+      12 +                                                               
+      13 +// A connection in subscribe mode cannot run other commands, so
+         + it gets its own.                                              
+      14 +export function getSubscriber(): Redis {                       
+      15 +  if (!subscriber) subscriber = new Redis(config.redisUrl, { la
+         +zyConnect: false, maxRetriesPerRequest: null });               
+      16 +  return subscriber;                                           
+      17 +}                                                              
+      18 +                                                               
+      19 +export const keys = {                                          
+      20 +  bucket: (ws: string) => `rl:${ws}`,                          
+      21 +  coolOff: (ws: string) => `cool:${ws}`,                       
+      22 +  breaker: (ws: string) => `brk:${ws}`,                        
+      23 +  seq: (ws: string) => `seq:${ws}`,                            
+      24 +  session: (id: string) => `sess:${id}`,                       
+      25 +  oidc: (state: string) => `oidc:${state}`,                    
+      26 +  eventsChannel: (ws: string) => `events:${ws}`,               
+      27 +  eventsPattern: 'events:*',                                   
+      28 +  outboxWake: 'outbox:wake',                                   
+      29 +};                                                             
+      30 +                                                               
+      31 +// Application data in Redis; sessions and in-progress logins a
+         +re kept on reset.                                              
+      32 +export const resettablePatterns = ['rl:*', 'cool:*', 'brk:*', '
+         +seq:*'];                                                       
+
+● Now the webhook signature check, the rate limiter, realtime events, and the
+  domain logic.
+
+● Write(scaffold\server\src\security\signature.ts)
+  ⎿  Wrote 37 lines to scaffold\server\src\security\signature.ts
+       1 import { createHmac, timingSafeEqual } from 'node:crypto';
+       2
+       3 export const SIGNATURE_TOLERANCE_SECONDS = 300;
+       4
+       5 export type SignatureResult = { ok: true; t: number } | { ok: fa
+         lse; reason: 'missing' | 'malformed' | 'mismatch' | 'stale' };
+       6
+       7 /**
+       8  * Verifies `x-pigeon-signature: t=<unix seconds>,v1=<hex>` wher
+         e v1 is
+     … +29 lines (ctrl+o to expand)
+
+● Write(scaffold\server\src\outbox\rateLimit.ts)
+  ⎿  Wrote 49 lines to scaffold\server\src\outbox\rateLimit.ts
+       1 import { getRedis, keys } from '../redis.js';
+       2
+       3 // Pigeon: bucket of 8, refills 4/s, per workspace. We stay a li
+         ttle under it
+       4 // so clock skew between us and Pigeon never costs a 429.
+       5 const CAPACITY = 6;
+       6 const RATE_PER_SEC = 3.5;
+       7
+       8 // Returns 0 if a token was taken, otherwise milliseconds to wai
+         t.
+     … +41 lines (ctrl+o to expand)
+
+● Write(scaffold\server\src\realtime\events.ts)
+  ⎿  Wrote 45 lines to scaffold\server\src\realtime\events.ts
+       1 import { col, isDupKey } from '../db.js';
+       2 import { getRedis, keys } from '../redis.js';
+       3
+       4 export type Frame = { seq: number; type: string; [k: string]: un
+         known };
+       5
+       6 /**
+       7  * Records one change for a workspace and fans it out to every i
+         nstance.
+       8  * `key` names the fact (e.g. `in:<message_id>`), so emitting th
+     … +38 lines (~2 KB) (ctrl+o to expand)
+
+● Write(scaffold\server\src\domain\conversations.ts)
+  ⎿  Wrote 98 lines to scaffold\server\src\domain\conversations.ts
+       1 import { ObjectId } from 'mongodb';
+       2 import { col, isDupKey, type ConversationDoc } from '../db.js';
+       3 import { emit } from '../realtime/events.js';
+       4
+       5 /** Creates the conversation if needed and bumps its activity ti
+         me. Safe under races. */
+       6 export async function touchConversation(workspace: string, conta
+         ct: string, at: Date, reopen = false): Promise<void> {
+       7   const conversations = await col.conversations();
+       8   const update = {
+     … +90 lines (ctrl+o to expand)
+
+● Write(scaffold\server\src\domain\inbound.ts)
+  ⎿  Wrote 61 lines to scaffold\server\src\domain\inbound.ts
+      1 import { col, isDupKey } from '../db.js';
+      2 import { emit } from '../realtime/events.js';
+      3 import { touchConversation } from './conversations.js';
+      4
+      5 export const STATUS_RANK: Record<string, number> = { queued: 0, s
+        ent: 1, delivered: 2, failed: 2 };
+      6
+      7 export class BadEvent extends Error {}
+      8
+      9 const str = (v: unknown): v is string => typeof v === 'string' &&
+     … +53 lines (~3 KB) (ctrl+o to expand)
+
+● Write(scaffold\server\src\domain\outbound.ts)
+  ⎿  Wrote 52 lines to scaffold\server\src\domain\outbound.ts
+       1 import { col, isDupKey } from '../db.js';
+       2 import { getRedis, keys } from '../redis.js';
+       3 import { emit } from '../realtime/events.js';
+       4 import { touchConversation } from './conversations.js';
+       5
+       6 export interface ReplyInput {
+       7   workspace: string;
+       8   contact: string;
+       9   text: string;
+      10   client_ref: string;
+     … +42 lines (ctrl+o to expand)
+
+● Write(scaffold\server\src\outbox\pigeonClient.ts)
+  ⎿  Wrote 55 lines to scaffold\server\src\outbox\pigeonClient.ts
+      1 import { config } from '../config.js';
+      2
+      3 export type SendResult =
+      4   | { kind: 'accepted'; id: string }
+      5   | { kind: 'rate_limited'; retryAfterMs: number }
+      6   | { kind: 'unavailable'; status: number }
+      7   | { kind: 'timeout' }
+      8   | { kind: 'network'; error: string }
+      9   | { kind: 'rejected'; status: number; body: string };
+     … +46 lines (ctrl+o to expand)
+
+● Write(scaffold\server\src\outbox\dispatcher.ts)
+  ⎿  Wrote 127 lines to scaffold\server\src\outbox\dispatcher.ts
+       1 import { config, instanceId } from '../config.js';
+       2 import { col, type MessageDoc } from '../db.js';
+       3 import { emit } from '../realtime/events.js';
+       4 import { getSubscriber, keys } from '../redis.js';
+       5 import { sendMessage } from './pigeonClient.js';
+       6 import { startCoolOff, takeToken, tripBreaker } from './rateLimi
+         t.js';
+       7
+       8 // A lease outlives one HTTP attempt (4 s timeout) with margin.
+         If the holder
+     … +119 lines (ctrl+o to expand)
+
+● Now auth and sessions.
+
+● Write(scaffold\server\src\auth\oidc.ts)
+  ⎿  Wrote 113 lines to scaffold\server\src\auth\oidc.ts
+       1 import { createHash, randomBytes } from 'node:crypto';
+       2 import { createRemoteJWKSet, jwtVerify, type JWTPayload } from '
+         jose';
+       3 import { config } from '../config.js';
+       4
+       5 interface Discovery {
+       6   issuer: string;
+       7   authorization_endpoint: string;
+       8   token_endpoint: string;
+       9   jwks_uri: string;
+     … +104 lines (ctrl+o to expand)
+● Write(scaffold\server\src\auth\sessions.ts)
+  ⎿  Wrote 73 lines to scaffold\server\src\auth\sessions.ts
+       1 import { randomBytes } from 'node:crypto';
+       2 import type { IncomingMessage } from 'node:http';
+       3 import { getRedis, keys } from '../redis.js';
+       4 import type { Identity } from './oidc.js';
+       5
+       6 export const SESSION_COOKIE = 'sb_sid';
+       7 export const SESSION_TTL_SECONDS = 8 * 3600;
+       8 const LOGIN_TTL_SECONDS = 600;
+       9
+      10 export type Session = Identity & { created_at: string };
+     … +63 lines (ctrl+o to expand)
+
+● Write(scaffold\server\src\http\middleware.ts)
+  ⎿  Wrote 46 lines to scaffold\server\src\http\middleware.ts
+       1 import { timingSafeEqual } from 'node:crypto';
+       2 import type { NextFunction, Request, RequestHandler, Response }
+         from 'express';
+       3 import { config } from '../config.js';
+       4 import { loadSession, roleIn, type Session } from '../auth/sessi
+         ons.js';
+       5
+       6 declare global {
+       7   // eslint-disable-next-line @typescript-eslint/no-namespace
+       8   namespace Express {
+     … +38 lines (ctrl+o to expand)
+
+● Now the HTTP routers.
+
+● Write(scaffold\server\src\http\webhooks.ts)
+  ⎿  Wrote 42 lines to scaffold\server\src\http\webhooks.ts
+       1 import express, { Router } from 'express';
+       2 import { config, knownWorkspace } from '../config.js';
+       3 import { applyStatus, BadEvent, recordInbound } from '../domain/
+         inbound.js';
+       4 import { verifyPigeonSignature } from '../security/signature.js'
+         ;
+       5
+       6 export const webhooks = Router();
+       7
+       8 // Raw body on this route only: the HMAC covers the exact bytes
+     … +35 lines (~2 KB) (ctrl+o to expand)
+
+● Write(scaffold\server\src\http\auth.ts)
+  ⎿  Wrote 52 lines to scaffold\server\src\http\auth.ts
+       1 import { Router } from 'express';
+       2 import { config } from '../config.js';
+       3 import { finishLogin, startLogin } from '../auth/oidc.js';
+       4 import { createSession, destroySession, saveLogin, sessionCookie
+         , sessionIdFrom, takeLogin } from '../auth/sessions.js';
+       5 import { requireSession, wrap } from './middleware.js';
+       6
+       7 export const auth = Router();
+       8
+       9 auth.get(
+     … +43 lines (ctrl+o to expand)
+
+● Write(scaffold\server\src\http\api.ts)
+  ⎿  Wrote 64 lines to scaffold\server\src\http\api.ts
+      1 import { randomUUID } from 'node:crypto';
+      2 import { Router } from 'express';
+      3 import { claimConversation, getThread, listConversations, release
+        Conversation, setConversationState } from '../domain/conversation
+        s.js';
+      4 import { enqueueReply } from '../domain/outbound.js';
+      5 import { requireMember, requireSession, wrap } from './middleware
+        .js';
+      6
+      7 // Everything here is scoped to one workspace the signed-in user
+     … +58 lines (~2 KB) (ctrl+o to expand)
+
+● Write(scaffold\server\src\http\grader.ts)
+  ⎿  Wrote 74 lines to scaffold\server\src\http\grader.ts
+       1 import { Router } from 'express';
+       2 import { config, knownWorkspace } from '../config.js';
+       3 import { col } from '../db.js';
+       4 import { claimConversation } from '../domain/conversations.js';
+       5 import { enqueueReply } from '../domain/outbound.js';
+       6 import { getRedis, resettablePatterns } from '../redis.js';
+       7 import { requireGraderToken, wrap } from './middleware.js';
+       8
+       9 // Same domain functions the UI routes call; only the auth diffe
+         rs.
+     … +65 lines (ctrl+o to expand)
+
+● Now the WebSocket hub and the entry point.
+
+● Write(scaffold\server\src\realtime\ws.ts)
+  ⎿  Wrote 153 lines to scaffold\server\src\realtime\ws.ts
+       1 import type { IncomingMessage, Server } from 'node:http';
+       2 import type { Duplex } from 'node:stream';
+       3 import { WebSocketServer, type WebSocket } from 'ws';
+       4 import { loadSession, roleIn } from '../auth/sessions.js';
+       5 import { getSubscriber, keys } from '../redis.js';
+       6 import { currentSeq, framesAfter, type Frame } from './events.js
+         ';
+       7
+       8 // How long to wait for a missing seq before asking MongoDB for
+         it. Two
+     … +145 lines (ctrl+o to expand)
+
+● Write(scaffold\server\src\index.ts)
+  ⎿  Added 40 lines, removed 7 lines
+       1 -import express from 'express';                                 
+       1 +import express, { type NextFunction, type Request, type Respons
+         +e } from 'express';                                            
+       2  import { createServer } from 'node:http';
+       3 -import { config } from './config.js';                          
+       3 +import { config, instanceId } from './config.js';              
+       4 +import { ensureIndexes } from './db.js';                       
+       5 +import { api } from './http/api.js';                           
+       6 +import { auth } from './http/auth.js';                         
+       7 +import { grader } from './http/grader.js';                     
+       8 +import { webhooks } from './http/webhooks.js';                 
+       9 +import { startDispatcher } from './outbox/dispatcher.js';      
+      10 +import { attachWebSockets } from './realtime/ws.js';           
+      11 +import { getRedis } from './redis.js';                         
+      12 
+      13  const app = express();
+      14 +app.disable('x-powered-by');                                   
+      15 +let ready = false;                                             
+      16 
+      17 +// 200 only once indexes exist and background work runs: the ch
+         +eck waits for it.                                              
+      18  app.get('/healthz', (_req, res) => {
+       8 -  res.json({ ok: true });                                      
+      19 +  res.status(ready ? 200 : 503).json({ ok: ready, instance: ins
+         +tanceId });                                                    
+      20  });
+      21 
+      11 -// Everything else is yours.                                   
+      22 +app.use(webhooks); // raw body; must come before the JSON parse
+         +r                                                              
+      23 +app.use(express.json({ limit: '100kb' }));                     
+      24 +app.use(auth);                                                 
+      25 +app.use(api);                                                  
+      26 +app.use(grader);                                               
+      27 
+      13 -// A plain http server, so you can attach WebSockets to it.    
+      28 +app.use((err: Error & { type?: string; status?: number }, _req:
+         + Request, res: Response, _next: NextFunction) => {             
+      29 +  if (err.type === 'entity.parse.failed') return res.status(400
+         +).json({ error: 'invalid JSON' });                             
+      30 +  if (err.status && err.status < 500) return res.status(err.sta
+         +tus).json({ error: err.message });                             
+      31 +  console.error('[http] unhandled', err);                      
+      32 +  res.status(500).json({ error: 'internal error' });           
+      33 +});                                                            
+      34 +                                                               
+      35  const server = createServer(app);
+      15 -server.listen(config.port, () => {                             
+      16 -  console.log(`server on http://localhost:${config.port}`);    
+      36 +                                                               
+      37 +async function main() {                                        
+      38 +  await ensureIndexes();                                       
+      39 +  await getRedis().ping();                                     
+      40 +  await attachWebSockets(server);                              
+      41 +  await startDispatcher();                                     
+      42 +  await new Promise<void>((resolve) => server.listen(config.por
+         +t, resolve));                                                  
+      43 +  ready = true;                                                
+      44 +  console.log(`[boot] ${instanceId} ready on http://localhost:$
+         +{config.port}`);                                               
+      45 +}                                                              
+      46 +                                                               
+      47 +main().catch((e) => {                                          
+      48 +  console.error('[boot] failed', e);                           
+      49 +  process.exit(1);                                             
+      50  });
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● The typecheck passes. Running Level 1 and Level 5 through the real harness:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Both levels pass (39/39). The harness kills instances with process.kill(-pid),
+  which can leave processes behind on Windows, so I'm checking for leftovers:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● The harness started these and couldn't kill them on Windows. Stopping them so
+  the next run starts clean:
+
+  Ran 1 shell command · 1 failed (ctrl+o to expand)
+
+● I've built the backend and it scores 39/39 on the real harness: Level 1 got
+  24/24 and Level 5 got 15/15. npm --prefix scaffold/server run build passes
+  with zero errors, and the server starts cleanly through switchboard.json. I
+  haven't run Levels 2 and 3 yet, and Level 4 can't be run locally.
+
+  What pigeon/server.js showed: Pigeon stores the Idempotency-Key response
+  before its 12-second slow reply, and it checks for repeats before the outage
+  and rate-limit checks. So after my 4-second client timeout, it's safe to retry
+  almost at once with the same key. The retry gets the original answer and
+  doesn't count against the rate limit. Its limits are a bucket of 8 refilling
+  at 4/s, and a 2-second cool-off after a 429.
+
+  Two changes from the approved plan:
+  - Lease is 10 s, not 20 s. Pigeon's behaviour means a lease only needs to
+    outlast one 4-second HTTP attempt. A shorter lease means a dead instance's
+    replies are picked up sooner.
+  - Duplicate events are checked before taking a seq number. Otherwise duplicate
+    webhooks would leave gaps in the numbering, and each gap holds back live
+    WebSocket delivery for 300 ms.
+
+  Modules in scaffold/server/src/:
+
+  File: db.ts (scaffold/server/src/db.ts)
+  Does: Collection types; unique indexes created at boot; journaled writes
+  ────────────────────────────────────────
+  File: redis.ts (scaffold/server/src/redis.ts)
+  Does: Command connection, separate pub/sub connection, key names
+  ────────────────────────────────────────
+  File: security/signature.ts (scaffold/server/src/security/signature.ts)
+  Does: Webhook signature check, no I/O (easy to unit-test)
+  ────────────────────────────────────────
+  File: http/webhooks.ts (scaffold/server/src/http/webhooks.ts)
+  Does: Check signature on the raw body, then parse, then ignore what should
+    be ignored, then store, then reply
+  ────────────────────────────────────────
+  File: domain/inbound.ts (scaffold/server/src/domain/inbound.ts)
+  Does: Stores inbound messages without duplicates; status only moves forward
+  ────────────────────────────────────────
+  File: domain/outbound.ts (scaffold/server/src/domain/outbound.ts)
+  Does: Queues replies; one reply per client_ref
+  ────────────────────────────────────────
+  File: domain/conversations.ts (scaffold/server/src/domain/conversations.ts)
+  Does: Claim, release, close/reopen, paginated inbox, message thread
+  ────────────────────────────────────────
+  File: outbox/ (scaffold/server/src/outbox/)
+  Does: Dispatcher with leases, Pigeon client, shared rate limit with cool-off
+    and outage pause
+  ────────────────────────────────────────
+  File: auth/ (scaffold/server/src/auth/) + http/auth.ts
+    (scaffold/server/src/http/auth.ts)
+  Does: Login with PKCE (S256), refetching keys when the IdP rotates them,
+    sessions in Redis
+  ────────────────────────────────────────
+  File: realtime/ (scaffold/server/src/realtime/)
+  Does: seq counter, frame log, replay with after, cross-instance fan-out,
+    reordering on gaps
+  ────────────────────────────────────────
+  File: http/api.ts (scaffold/server/src/http/api.ts), http/grader.ts
+    (scaffold/server/src/http/grader.ts)
+  Does: UI API and grader endpoints, both calling the same domain functions
+
+  New dependencies: ws, jose, @types/ws. I also added a build script.
+
+  Windows problem with the harness: it stops instances with process.kill(-pid),
+  which doesn't work on Windows. After the run, both server instances were still
+  listening on :4001 and :4002, and I stopped them. This means a local Level 2
+  or 3 run (which relies on kill -9) won't actually kill anything, so its
+  results would be misleading. Run those levels from WSL or Linux.
+
+  Next steps:
+  - Run npm run check:full under WSL to cover Levels 2 and 3.
+  - Write the React frontend.
+  - Commit. The folder isn't a git repository yet, and the brief wants commits
+    every 15 minutes.
+
+> <ide_opened_file>The user opened the file c:\Users\HP\Downloads\starter\start
+  er\ai-logs\2026-11-27-183211-pastedcontent-id497e.txt in the IDE. This may or
+  may not be related to the current task.</ide_opened_file>
+
+> <task>
+  Build the React frontend in `scaffold/web/` connected to our backend API and
+  WebSocket (`/ws`), plus 2–3 focused unit tests for our critical backend
+  logic.
+  </task>
+
+  <frontend_rules>
+  - Inspect `scaffold/server/src/http/api.ts` and `scaffold/web/` first so
+  every API route, query parameter, JSON payload, and WebSocket event frame
+  matches 100%.
+  - Keep components modular inside `scaffold/web/src/components/` (do NOT dump
+  everything into `App.tsx`).
+  - Support the full agent workflow required by `BRIEF.md`:
+    1. **Auth & Workspace Switcher:** Check `GET /api/me`; if `401`, show a
+  clean "Sign in with Switchboard IdP" screen linking to `/auth/login`. Once
+  signed in, display user identity, role (`admin`/`agent`), and a workspace
+  switcher (`ws_acme`, `ws_globex`) filtered to the user's `workspaces` claim.
+    2. **Inbox List (Left Pane):** Paginated conversations for the active
+  workspace, ordered by `last_activity_at` descending, showing contact number,
+  latest snippet/timestamp, open/closed badge, and assignee badge.
+    3. **Conversation Thread (Center/Right Pane):** Chronological messages
+  (`occurred_at` ascending), clear visual distinction between inbound customer
+  messages and outbound agent replies, and live delivery status badges
+  (`queued`, `sent`, `delivered`, `failed`) on outbound replies.
+    4. **Conversation Actions & Reply Box:** Claim / Release button (`409`
+  conflict alert if another agent already holds it), Close / Reopen toggle, and
+  a reply composer (`client_ref` generated via `crypto.randomUUID()`) with
+  input validation and immediate UI update.
+    5. **Real-Time WebSocket Sync:** Connect to
+  `/ws?workspace=<id>&after=<lastSeq>` (using `ws://` or `wss://` matching
+  `window.location`), apply `message.inbound`, `message.status`, and
+  `conversation.assigned` frames live without refresh, automatically reconnect
+  with exponential backoff on disconnect passing `after=<lastSeq>` so nothing
+  is missed, and show a subtle connection status indicator (Live /
+  Reconnecting).
+  - Keep styling clean, fast, and readable (clean CSS or Tailwind if
+  configured—check `scaffold/web/package.json` before adding unnecessary
+  dependencies).
+  - Ensure `npm --prefix scaffold/web run build` succeeds with zero
+  TypeScript/Vite errors.
+  </frontend_rules>
+
+  <tests_rule>
+  - Add fast, zero-external-dependency unit tests (using Node's built-in
+  `node:test` and `node:assert`) in `scaffold/server/test/` testing
+  `security/signature.ts` (valid sig, wrong secret, tampered raw body, expired
+  >5m timestamp, future >5m timestamp) and status rank / message ordering
+  logic, plus a `"test"` script in `scaffold/server/package.json`. Run them and
+  verify they pass.
+  </tests_rule>
+
+● I'll look at the web scaffold first.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● No Tailwind is configured, so I'll use plain CSS; dependencies are installing
+  in the background while I add inbox snippets and an ordering module for the
+  tests. · summary
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Write(scaffold\server\src\domain\ordering.ts)
+  ⎿  Wrote 30 lines to scaffold\server\src\domain\ordering.ts
+       1 // Pure rules shared by storage, snapshot and UI. No I/O, so the
+         y are unit-tested directly.
+       2
+       3 export const STATUS_RANK: Record<string, number> = { queued: 0,
+         sent: 1, delivered: 2, failed: 2 };
+       4
+       5 /**
+       6  * Status only moves forward: queued < sent < delivered|failed.
+         Returns the
+       7  * status to keep. Out-of-order (delivered before sent), duplica
+     … +24 lines (ctrl+o to expand)
+
+● Update(scaffold\server\src\domain\inbound.ts)
+  ⎿  Added 1 line, removed 2 lines
+      1  import { col, isDupKey } from '../db.js';
+      2  import { emit } from '../realtime/events.js';
+      3  import { touchConversation } from './conversations.js';
+      4 +import { STATUS_RANK } from './ordering.js';                    
+      5 
+      5 -export const STATUS_RANK: Record<string, number> = { queued: 0, 
+        -sent: 1, delivered: 2, failed: 2 };                             
+      6 -                                                                
+      6  export class BadEvent extends Error {}
+      7 
+      8  const str = (v: unknown): v is string => typeof v === 'string' &
+         & v.length > 0 && v.length <= 4096;
+
+● Update(scaffold\server\src\domain\conversations.ts)
+  ⎿  Added 17 lines, removed 1 line
+      71    const docs = await conversations.find(filter).sort({ last_act
+          ivity_at: -1, _id: -1 }).limit(limit + 1).toArray();
+      72    const page = docs.slice(0, limit);
+      73    const last = page[page.length - 1];
+      74 +  // Latest message per contact on this page, for the snippet. 
+         +One query.                                                     
+      75 +  const latest = await (await col.messages())                  
+      76 +    .aggregate<{ _id: string; text: string; direction: string }
+         +>([                                                            
+      77 +      { $match: { workspace, contact: { $in: page.map((d) => d.
+         +contact) } } },                                                
+      78 +      { $sort: { occurred_at: -1, pigeon_id: -1 } },           
+      79 +      { $group: { _id: '$contact', text: { $first: '$text' }, d
+         +irection: { $first: '$direction' } } },                        
+      80 +    ])                                                         
+      81 +    .toArray();                                                
+      82 +  const snippet = new Map(latest.map((l) => [l._id, l]));      
+      83    return {
+      75 -    items: page.map((d) => ({ contact: d.contact, assignee: d.a
+         -ssignee, state: d.state, last_activity_at: d.last_activity_at.t
+         -oISOString() })),                                              
+      84 +    items: page.map((d) => ({                                  
+      85 +      contact: d.contact,                                      
+      86 +      assignee: d.assignee,                                    
+      87 +      state: d.state,                                          
+      88 +      last_activity_at: d.last_activity_at.toISOString(),      
+      89 +      last_text: snippet.get(d.contact)?.text ?? null,         
+      90 +      last_direction: snippet.get(d.contact)?.direction ?? null
+         +,                                                              
+      91 +    })),                                                       
+      92      next_cursor: docs.length > limit && last ? Buffer.from(`${l
+          ast.last_activity_at.getTime()}|${last._id!.toHexString()}`).to
+          String('base64url') : null,
+      93    };
+      94  }
+
+● Update(scaffold\server\src\domain\conversations.ts)
+  ⎿  Added 1 line, removed 1 line
+      52  }
+      53 
+      54  export interface InboxPage {
+      55 -  items: Array<Pick<ConversationDoc, 'contact' | 'assignee' | '
+         -state'> & { last_activity_at: string }>;                       
+      55 +  items: Array<Pick<ConversationDoc, 'contact' | 'assignee' | '
+         +state'> & { last_activity_at: string; last_text: string | null;
+         + last_direction: string | null }>;                             
+      56    next_cursor: string | null;
+      57  }
+      58 
+● Now the tests:
+
+● Write(scaffold\server\test\signature.test.ts)
+  ⎿  Wrote 49 lines to scaffold\server\test\signature.test.ts
+       1 import assert from 'node:assert/strict';
+       2 import { createHmac } from 'node:crypto';
+       3 import { test } from 'node:test';
+       4 import { verifyPigeonSignature } from '../src/security/signature
+         .js';
+       5
+       6 const SECRET = 'whsec_pigeon_dev';
+       7 const NOW = 1_795_016_513_000; // fixed clock, ms
+       8 const body = Buffer.from('{"id":"evt_1","type":"message.inbound"
+         ,"workspace":"ws_acme","data":{"message_id":"pmsg_1"}}');
+     … +41 lines (ctrl+o to expand)
+
+● Write(scaffold\server\test\ordering.test.ts)
+  ⎿  Wrote 37 lines to scaffold\server\test\ordering.test.ts
+       1 import assert from 'node:assert/strict';
+       2 import { test } from 'node:test';
+       3 import { compareMessages, nextStatus } from '../src/domain/order
+         ing.js';
+       4
+       5 const apply = (events: string[]) => events.reduce(nextStatus, 'q
+         ueued');
+       6
+       7 test('status moves forward through the normal lifecycle', () =>
+         {
+     … +30 lines (ctrl+o to expand)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Background command "Install web dependencies" completed (exit code 0)
+
+● All 12 tests pass and the server typecheck is still clean. Now the frontend,
+  starting with the API layer and the realtime hook:
+
+● Write(scaffold\web\src\api.ts)
+  ⎿  Wrote 97 lines to scaffold\web\src\api.ts
+      1 // Types and calls mirror scaffold/server/src/http/{auth,api}.ts
+        exactly.
+      2
+      3 export type Role = 'admin' | 'agent';
+      4 export interface Me {
+      5   sub: string;
+      6   name: string | null;
+      7   email: string | null;
+      8   workspaces: Array<{ id: string; role: Role }>;
+      9 }
+     … +88 lines (ctrl+o to expand)
+
+● Write(scaffold\web\src\useRealtime.ts)
+  ⎿  Wrote 72 lines to scaffold\web\src\useRealtime.ts
+       1 import { useCallback, useEffect, useRef, useState } from 'react'
+         ;
+       2 import type { Frame } from './api';
+       3
+       4 export type Connection = 'connecting' | 'live' | 'reconnecting';
+       5 type Listener = (f: Frame) => void;
+       6
+       7 /**
+       8  * One socket per workspace. Remembers the highest seq it has ap
+         plied and
+     … +64 lines (ctrl+o to expand)
+
+● Now the components:
+
+● Write(scaffold\web\src\components\SignIn.tsx)
+  ⎿  Wrote 13 lines to scaffold\web\src\components\SignIn.tsx
+       1 export function SignIn() {
+       2   return (
+       3     <main className="signin">
+       4       <div className="signin-card">
+       5         <h1>Switchboard</h1>
+       6         <p>The shared inbox for your support team.</p>
+       7         <a className="btn primary" href="/auth/login">
+       8           Sign in with Switchboard IdP
+       9         </a>
+      10       </div>
+     … +3 lines (ctrl+o to expand)
+
+● Write(scaffold\web\src\components\Header.tsx)
+  ⎿  Wrote 41 lines to scaffold\web\src\components\Header.tsx
+       1 import type { Me } from '../api';
+       2 import type { Connection } from '../useRealtime';
+       3
+       4 interface Props {
+       5   me: Me;
+       6   workspace: string;
+       7   onWorkspace: (id: string) => void;
+       8   connection: Connection;
+       9   onLogout: () => void;
+      10 }
+     … +31 lines (ctrl+o to expand)
+
+● Write(scaffold\web\src\components\StatusBadge.tsx)
+  ⎿  Wrote 8 lines to scaffold\web\src\components\StatusBadge.tsx
+      1 import type { Message } from '../api';
+      2
+      3 export function StatusBadge({ message }: { message: Message }) {
+      4   if (message.local === 'sending') return <span className="badge
+        st-queued">sending…</span>;
+      5   if (message.local === 'error') return <span className="badge st
+        -failed">not saved</span>;
+      6   const s = message.status ?? 'queued';
+      7   return <span className={`badge st-${s}`}>{s}</span>;
+      8 }
+
+● Write(scaffold\web\src\components\Inbox.tsx)
+  ⎿  Wrote 120 lines to scaffold\web\src\components\Inbox.tsx
+       1 import { useCallback, useEffect, useState } from 'react';
+       2 import { api, type ConversationSummary, type Frame } from '../ap
+         i';
+       3
+       4 interface Props {
+       5   workspace: string;
+       6   selected: string | null;
+       7   onSelect: (contact: string) => void;
+       8   subscribe: (l: (f: Frame) => void) => () => void;
+       9   reloadToken: number;
+     … +111 lines (ctrl+o to expand)
+
+● Write(scaffold\web\src\components\Composer.tsx)
+  ⎿  Wrote 34 lines to scaffold\web\src\components\Composer.tsx
+       1 import { useState, type FormEvent, type KeyboardEvent } from 're
+         act';
+       2
+       3 const MAX = 4000;
+       4
+       5 export function Composer({ onSend, disabled }: { onSend: (text:
+         string) => void; disabled?: boolean }) {
+       6   const [text, setText] = useState('');
+       7   const trimmed = text.trim();
+       8   const tooLong = trimmed.length > MAX;
+     … +26 lines (ctrl+o to expand)
+
+● Write(scaffold\web\src\components\ThreadView.tsx)
+  ⎿  Wrote 173 lines to scaffold\web\src\components\ThreadView.tsx
+       1 import { useCallback, useEffect, useRef, useState } from 'react'
+         ;
+       2 import { api, ApiError, byOccurredAt, laterStatus, type Frame, t
+         ype Message, type Role, type Thread } from '../api';
+       3 import { Composer } from './Composer';
+       4 import { StatusBadge } from './StatusBadge';
+       5
+       6 interface Props {
+       7   workspace: string;
+       8   contact: string;
+     … +165 lines (ctrl+o to expand)
+
+● The message.status case would overwrite the reply text with an empty string,
+  so I'm replacing it with a direct status merge:
+
+● Update(scaffold\web\src\components\ThreadView.tsx)
+  ⎿  Added 7 lines, removed 4 lines
+      66                return { ...t, state: 'open', messages: upsert(t.
+          messages, { direction: 'in', message_id: f.message_id, client_r
+          ef: null, text: f.text, occurred_at: f.occurred_at, author: nul
+          l }) };
+      67              case 'message.outbound':
+      68                return { ...t, messages: upsert(t.messages, { dir
+          ection: 'out', message_id: null, client_ref: f.client_ref, text
+          : f.text, occurred_at: new Date().toISOString(), status: f.stat
+          us, author: null }) };
+      69 -            case 'message.status': {                           
+      70 -              if (!t.messages.some((m) => m.direction === 'out'
+         - && m.client_ref === f.client_ref)) return t;                  
+      71 -              return { ...t, messages: upsert(t.messages, { dir
+         -ection: 'out', message_id: f.message_id, client_ref: f.client_r
+         -ef, text: '', occurred_at: '', status: f.status, author: null }
+         -).map((m) => (m.client_ref === f.client_ref && !m.text ? m : m)
+         -) };                                                           
+      72 -            }                                                  
+      69 +            case 'message.status':                             
+      70 +              return {                                         
+      71 +                ...t,                                          
+      72 +                messages: t.messages.map((m) =>                
+      73 +                  m.direction === 'out' && m.client_ref === f.c
+         +lient_ref ? { ...m, status: laterStatus(m.status, f.status), me
+         +ssage_id: f.message_id ?? m.message_id } : m,                  
+      74 +                ),                                             
+      75 +              };                                               
+      76              case 'conversation.assigned':
+      77                return { ...t, assignee: f.assignee };
+      78              case 'conversation.state':
+
+● Write(scaffold\web\src\App.tsx)
+  ⎿  Added 70 lines, removed 12 lines
+       1 -import { useEffect, useState } from 'react';                   
+       1 +import { useCallback, useEffect, useState } from 'react';      
+       2 +import { api, ApiError, type Me } from './api';                
+       3 +import { Header } from './components/Header';                  
+       4 +import { Inbox } from './components/Inbox';                    
+       5 +import { SignIn } from './components/SignIn';                  
+       6 +import { ThreadView } from './components/ThreadView';          
+       7 +import { useRealtime } from './useRealtime';                   
+       8 
+       3 -// Placeholder. It only proves the browser can reach your serve
+         -r through the                                                  
+       4 -// Vite proxy. Replace it with the product.                    
+       9 +const WS_KEY = 'sb.workspace';                                 
+      10 +const read = (k: string) => {                                  
+      11 +  try {                                                        
+      12 +    return localStorage.getItem(k);                            
+      13 +  } catch {                                                    
+      14 +    return null;                                               
+      15 +  }                                                            
+      16 +};                                                             
+      17 +const write = (k: string, v: string) => {                      
+      18 +  try {                                                        
+      19 +    localStorage.setItem(k, v);                                
+      20 +  } catch {                                                    
+      21 +    /* private mode */                                         
+      22 +  }                                                            
+      23 +};                                                             
+      24 +                                                               
+      25  export function App() {
+       6 -  const [server, setServer] = useState('checking…');           
+      26 +  const [me, setMe] = useState<Me | null | 'anon'>(null);      
+      27 +  const [error, setError] = useState<string | null>(null);     
+      28 +  const [workspace, setWorkspace] = useState<string | null>(nul
+         +l);                                                            
+      29 +  const [selected, setSelected] = useState<string | null>(null)
+         +;                                                              
+      30 +  const [reloadToken, setReloadToken] = useState(0);           
+      31 
+      32    useEffect(() => {
+       9 -    fetch('/healthz')                                          
+      10 -      .then((res) => (res.ok ? 'reachable' : `answered ${res.st
+         -atus}`))                                                       
+      11 -      .catch(() => 'not reachable (is it running on :4000?)')  
+      12 -      .then(setServer);                                        
+      33 +    api                                                        
+      34 +      .me()                                                    
+      35 +      .then((m) => {                                           
+      36 +        setMe(m);                                              
+      37 +        const saved = read(WS_KEY);                            
+      38 +        setWorkspace(m.workspaces.find((w) => w.id === saved)?.
+         +id ?? m.workspaces[0]?.id ?? null);                            
+      39 +      })                                                       
+      40 +      .catch((e) => (e instanceof ApiError && e.status === 401 
+         +? setMe('anon') : setError((e as Error).message)));            
+      41    }, []);
+      42 
+      43 +  // No seq to resume from (first connect): reload everything o
+         +ver REST.                                                      
+      44 +  const resync = useCallback(() => setReloadToken((n) => n + 1)
+         +, []);                                                         
+      45 +  const { connection, subscribe } = useRealtime(me && me !== 'a
+         +non' ? workspace : null, resync);                              
+      46 +                                                               
+      47 +  const switchWorkspace = (id: string) => {                    
+      48 +    write(WS_KEY, id);                                         
+      49 +    setWorkspace(id);                                          
+      50 +    setSelected(null);                                         
+      51 +  };                                                           
+      52 +                                                               
+      53 +  const logout = async () => {                                 
+      54 +    await api.logout();                                        
+      55 +    setMe('anon');                                             
+      56 +  };                                                           
+      57 +                                                               
+      58 +  if (error) return <div className="alert page">Could not reach
+         + the server: {error}</div>;                                    
+      59 +  if (me === null) return <div className="empty page">Loading…<
+         +/div>;                                                         
+      60 +  if (me === 'anon') return <SignIn />;                        
+      61 +  if (!workspace) return <div className="empty page">Your accou
+         +nt is not a member of any workspace.</div>;                    
+      62 +                                                               
+      63 +  const role = me.workspaces.find((w) => w.id === workspace)!.r
+         +ole;                                                           
+      64    return (
+      16 -    <main style={{ font: '16px system-ui', maxWidth: 560, margi
+         -n: '80px auto' }}>                                             
+      17 -      <h1>Switchboard</h1>                                     
+      18 -      <p>Server: {server}</p>                                  
+      19 -    </main>                                                    
+      65 +    <div className="app">                                      
+      66 +      <Header me={me} workspace={workspace} onWorkspace={switch
+         +Workspace} connection={connection} onLogout={logout} />        
+      67 +      <div className="panes">                                  
+      68 +        <Inbox key={workspace} workspace={workspace} selected={
+         +selected} onSelect={setSelected} subscribe={subscribe} reloadTo
+         +ken={reloadToken} me={me.sub} />                               
+      69 +        {selected ? (                                          
+      70 +          <ThreadView key={`${workspace}|${selected}`} workspac
+         +e={workspace} contact={selected} me={me.sub} role={role} subscr
+         +ibe={subscribe} reloadToken={reloadToken} />                   
+      71 +        ) : (                                                  
+      72 +          <section className="thread">                         
+      73 +            <div className="empty">Pick a conversation.</div>  
+      74 +          </section>                                           
+      75 +        )}                                                     
+      76 +      </div>                                                   
+      77 +    </div>                                                     
+      78    );
+      79  }
+
+● Write(scaffold\web\src\styles.css)
+  ⎿  Wrote 115 lines to scaffold\web\src\styles.css
+       1 :root {
+       2   --bg: #f6f7f9;
+       3   --surface: #ffffff;
+       4   --line: #e3e6eb;
+       5   --ink: #1d2430;
+       6   --muted: #6b7482;
+       7   --accent: #2f5bea;
+       8   --accent-ink: #ffffff;
+       9   --in-bubble: #eef1f5;
+      10   --out-bubble: #2f5bea;
+     … +105 lines (ctrl+o to expand)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Two type errors. I'll fix both: type the send parameter as string, and add the
+  Vite client types.
+
+● Update(scaffold\web\src\components\ThreadView.tsx)
+  ⎿  Added 1 line, removed 1 line
+      86    const count = thread?.messages.length ?? 0;
+      87    useEffect(() => bottom.current?.scrollIntoView({ block: 'end'
+           }), [count]);
+      88 
+      89 -  const send = async (text: string, ref = crypto.randomUUID()) 
+         -=> {                                                           
+      89 +  const send = async (text: string, ref: string = crypto.random
+         +UUID()) => {                                                   
+      90      const optimistic: Message = { direction: 'out', message_id:
+           null, client_ref: ref, text, occurred_at: new Date().toISOStri
+          ng(), status: 'queued', author: me, local: 'sending' };
+      91      setThread((t) => (t ? { ...t, messages: upsert(t.messages,
+          optimistic) } : t));
+      92      try {
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Both builds are clean. Since I changed listConversations, I'm re-running Level
+  5 to make sure the API is still correct:
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● The React frontend is built and the tests are in. All 12 unit tests pass, both
+  the server and web builds have zero errors, and Level 5 still scores 15/15
+  after my backend change. I haven't clicked through the UI in a browser yet, so
+  the live screens are untested by hand.
+
+  Frontend (scaffold/web/src/, plain CSS since no Tailwind was configured; no
+  new dependencies):
+
+  File: api.ts (scaffold/web/src/api.ts)
+  What it covers: Types and calls matching the server routes; WebSocket frame
+    types; the same "status never goes backwards" rule as the server
+  ────────────────────────────────────────
+  File: useRealtime.ts (scaffold/web/src/useRealtime.ts)
+  What it covers: One socket per workspace using ws:// or wss:// to match the
+    page. It remembers the last seq and reconnects with exponential backoff
+    and after=<lastSeq>. On a first connect, with nothing to resume from, it
+    reloads data over REST.
+  ────────────────────────────────────────
+  File: components/SignIn.tsx (scaffold/web/src/components/SignIn.tsx)
+  What it covers: Shown when /api/me returns 401; links to /auth/login
+  ────────────────────────────────────────
+  File: components/Header.tsx (scaffold/web/src/components/Header.tsx)
+  What it covers: User name, role badge, workspace switcher limited to the
+    user's workspaces, Live / Reconnecting indicator, sign out
+  ────────────────────────────────────────
+  File: components/Inbox.tsx (scaffold/web/src/components/Inbox.tsx)
+  What it covers: Paginated list with "Load more", snippet, time, open/closed
+    and assignee badges; live updates move conversations to the top
+  ────────────────────────────────────────
+  File: components/ThreadView.tsx (scaffold/web/src/components/ThreadView.tsx)
+  What it covers: Messages ordered by occurred_at, inbound and outbound shown
+    differently, live status badges, Claim / Release (409 shows "Another agent
+    already holds this conversation"), Close / Reopen
+  ────────────────────────────────────────
+  File: components/Composer.tsx (scaffold/web/src/components/Composer.tsx)
+  What it covers: Reply box with length check (max 4000), Enter to send.
+    Replies appear immediately with a crypto.randomUUID() client_ref. If
+    saving fails, Retry resends with the same client_ref, so it can't create a
+    second reply.
+
+  Backend changes:
+  - The inbox list now includes last_text and last_direction for snippets,
+    fetched with one extra query per page.
+  - The status ranking and message ordering rules now live in a new file,
+    domain/ordering.ts (scaffold/server/src/domain/ordering.ts), so the tests
+    can import them directly.
+
+  Tests (npm --prefix scaffold/server test, using node:test through the existing
+  tsx):
+  - test/signature.test.ts (scaffold/server/test/signature.test.ts) covers:
+    - a valid signature, and one exactly 5 minutes old;
+    - the wrong secret;
+    - a tampered body, including the same JSON re-serialised;
+    - timestamps more than 5 minutes in the past or the future;
+    - malformed headers, including wrong-length hex that would otherwise crash
+      timingSafeEqual.
+  - test/ordering.test.ts (scaffold/server/test/ordering.test.ts) covers:
+    - delivered arriving before sent;
+    - duplicate and unknown statuses;
+    - the first final status winning;
+    - sorting by occurred_at, then message id, whatever the arrival order.
+
+  To try it: run npm run scaffold:server and npm run scaffold:web, then open
+  http://localhost:5173. The harness again left server instances running on
+  Windows, and I stopped them. Still to do: test the UI in a browser, run Levels
+  2 and 3 under WSL, initialise git and commit, and write README.md and
+  DECISIONS.md.

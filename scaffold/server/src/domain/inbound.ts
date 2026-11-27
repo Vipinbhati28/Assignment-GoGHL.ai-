@@ -1,8 +1,7 @@
 import { col, isDupKey } from '../db.js';
 import { emit } from '../realtime/events.js';
 import { touchConversation } from './conversations.js';
-
-export const STATUS_RANK: Record<string, number> = { queued: 0, sent: 1, delivered: 2, failed: 2 };
+import { STATUS_RANK } from './ordering.js';
 
 export class BadEvent extends Error {}
 

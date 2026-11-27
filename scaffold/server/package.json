@@ -6,7 +6,8 @@
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
     "typecheck": "tsc --noEmit",
-    "build": "tsc -p ."
+    "build": "tsc -p .",
+    "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {
     "express": "^4.22.3",
