@@ -36,3 +36,9 @@ export const config = {
     webhookSecret: env('PAYBOX_WEBHOOK_SECRET', 'whsec_paybox_dev'),
   },
 };
+
+// Unique per process; used as the outbox lease owner.
+export const instanceId = `${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+
+export const knownWorkspace = (ws: unknown): ws is string =>
+  typeof ws === 'string' && Object.prototype.hasOwnProperty.call(config.pigeon.apiKeys, ws);
