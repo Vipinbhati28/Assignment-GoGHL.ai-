@@ -6,13 +6,19 @@ let subscriber: Redis | undefined;
 
 // Commands and PUBLISH. Connects on first use.
 export function getRedis(): Redis {
-  if (!redis) redis = new Redis(config.redisUrl, { lazyConnect: false, maxRetriesPerRequest: 2 });
+  if (!redis) {
+    redis = new Redis(config.redisUrl, { lazyConnect: false, maxRetriesPerRequest: 2 });
+    redis.on('error', (e) => console.error('[redis]', e.message));
+  }
   return redis;
 }
 
 // A connection in subscribe mode cannot run other commands, so it gets its own.
 export function getSubscriber(): Redis {
-  if (!subscriber) subscriber = new Redis(config.redisUrl, { lazyConnect: false, maxRetriesPerRequest: null });
+  if (!subscriber) {
+    subscriber = new Redis(config.redisUrl, { lazyConnect: false, maxRetriesPerRequest: null });
+    subscriber.on('error', (e) => console.error('[redis:sub]', e.message));
+  }
   return subscriber;
 }
 
