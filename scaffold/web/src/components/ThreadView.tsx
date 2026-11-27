@@ -84,7 +84,11 @@ export function ThreadView({ workspace, contact, me, role, subscribe, reloadToke
   );
 
   const count = thread?.messages.length ?? 0;
-  useEffect(() => bottom.current?.scrollIntoView({ block: 'end' }), [count]);
+  // Block body on purpose: scrollIntoView() returns a Promise in current
+  // browsers, and an effect may only return a cleanup function.
+  useEffect(() => {
+    bottom.current?.scrollIntoView({ block: 'end' });
+  }, [count]);
 
   const send = async (text: string, ref: string = crypto.randomUUID()) => {
     const optimistic: Message = { direction: 'out', message_id: null, client_ref: ref, text, occurred_at: new Date().toISOString(), status: 'queued', author: me, local: 'sending' };
